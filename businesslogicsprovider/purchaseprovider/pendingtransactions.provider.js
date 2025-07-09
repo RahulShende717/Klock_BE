@@ -1,0 +1,210 @@
+import PurchaseQueries from "../../models/purchasequeries.model.js";
+import CachedData from "../../models/cacheddata.model.js";
+import { getPoolObj } from "../../utils/pool.js";
+import { getFundWiseSchema } from "../../utils/schemamapping.js";
+import { get_common_pendingtransactions } from "../../utils/getfilterpendingtransactions.js";
+import { cache_transaction_journey_provider } from "../transactionlifecyle.provider.js";
+
+export const pendingtransactionsData = async (
+  trdate,
+  fundcode,
+  snsstatus = false
+) => {
+  try {
+    let dataObject = {};
+    let filteredPendingTransaction = [];
+    let transaction_date = trdate;
+    let fund = fundcode;
+    let schema = getFundWiseSchema(fund);
+    const pool = getPoolObj(fund);
+    if (pool == null) console.log("No Pool Connections For This AMC", fund);
+    const keysToCheck = [
+      "topPendingTransactionCombined",
+      "topPendingTransactionLiquid",
+      "topPendingTransactionNonLiquid",
+      "pendingReasonsCombine",
+      "pendingReasonsNonLiquid",
+      "pendingReasonsLiquid",
+      "deleted_transactions",
+      "rejected_transactions",
+    ];
+
+    const isDataPresent = await CachedData.findOne({
+      $and: [
+        { fund: fund, date: transaction_date, type: "purchase" },
+        {
+          $and: keysToCheck.map((key) => ({
+            [`dataObject.${key}`]: { $exists: true },
+          })),
+        },
+      ],
+    });
+    if (!snsstatus && isDataPresent != null) {
+      return {
+        topPendingTransactionNonLiquid:
+          isDataPresent.dataObject.topPendingTransactionNonLiquid,
+        topPendingTransactionLiquid:
+          isDataPresent.dataObject.topPendingTransactionLiquid,
+        topPendingTransactionCombined:
+          isDataPresent.dataObject.topPendingTransactionCombined,
+        pendingReasonsLiquid: isDataPresent.dataObject.pendingReasonsLiquid,
+        pendingReasonsCombine: isDataPresent.dataObject.pendingReasonsCombine,
+        pendingReasonsNonLiquid:
+          isDataPresent.dataObject.pendingReasonsNonLiquid,
+        deletedTransactions: isDataPresent.dataObject.deleted_transactions,
+        rejectedTransactions: isDataPresent.dataObject.rejected_transactions,
+      };
+    } else {
+      const calculate_result = async (array) => {
+        array.forEach((item) => {
+          const rows = item.result;
+          if (item.name == "pending_transactions_liquid") {
+            dataObject["topPendingTransactionLiquid"] = rows;
+          } else if (item.name == "pending_transactions_combine") {
+            dataObject["topPendingTransactionCombined"] = rows;
+          } else if (item.name == "pending_transactions_nonliquid") {
+            dataObject["topPendingTransactionNonLiquid"] = rows;
+          } else if (item.name == "pending_reasons_combine") {
+            dataObject["pendingReasonsCombine"] = rows;
+          } else if (item.name == "pending_reasons_liquid") {
+            dataObject["pendingReasonsLiquid"] = rows;
+          } else if (item.name == "pending_reasons_nonliquid") {
+            dataObject["pendingReasonsNonLiquid"] = rows;
+          } else if (item.name == "deleted_transactions") {
+            let obj = {
+              combine: [],
+              liquid: [],
+              nonliquid: [],
+            };
+
+            rows.forEach((ele, ind) => {
+              obj.combine.push(ele);
+              if (ele.asset_class == "LIQUID") {
+                obj.liquid.push(ele);
+              } else if (ele.asset_class == "NON LIQUID") {
+                obj.nonliquid.push(ele);
+              }
+            });
+
+            dataObject["deleted_transactions"] = obj;
+          } else if (item.name == "rejected_transactions") {
+            let obj = {
+              combine: [],
+              liquid: [],
+              nonliquid: [],
+            };
+
+            rows.forEach((ele, ind) => {
+              obj.combine.push(ele);
+              if (ele.asset_class == "LIQUID") {
+                obj.liquid.push(ele);
+              } else if (ele.asset_class == "NON LIQUID") {
+                obj.nonliquid.push(ele);
+              }
+            });
+
+            dataObject["rejected_transactions"] = obj;
+          }
+        });
+        return dataObject;
+      };
+
+      const fetch_results = async (queries) => {
+        return Promise.all(
+          queries.map(async (queryObj) => {
+            const result = await pool.query(queryObj.query);
+            return {
+              name: queryObj.name,
+              result: result.rows,
+            };
+          })
+        );
+      };
+
+      const main = async () => {
+        let formattedQueries = [];
+        let purchesQueries = await PurchaseQueries.findOne(
+          { endpoint: "PendingTransactions" },
+          { queriesArray: 1 }
+        );
+        let queriesArray = purchesQueries.queriesArray;
+        queriesArray.map((ele) => {
+          let formattedQuery = ele.query.replace(
+            /transactionDate/g,
+            `${transaction_date}`
+          );
+          formattedQuery = formattedQuery.replace(/schema/g, `${schema}`);
+          formattedQuery = formattedQuery.replace(/'fund'/g, `'${fund}'`);
+          formattedQueries.push({ name: ele.name, query: formattedQuery });
+        });
+        const all_results = await fetch_results(formattedQueries);
+        await calculate_result(all_results);
+
+        const common_ihnos_list = await get_common_pendingtransactions(
+          dataObject.topPendingTransactionCombined,
+          dataObject.topPendingTransactionNonLiquid,
+          dataObject.topPendingTransactionLiquid
+        );
+
+        //pre-compute results for all ihno
+        cache_transaction_journey_provider(
+          // dataObject.topPendingTransactionLiquid,
+          common_ihnos_list,
+          fund,
+          transaction_date,
+          "purchase"
+        );
+
+        const cached_data = await CachedData.findOneAndUpdate(
+          { fund: fund, date: transaction_date, type: "purchase" },
+          {
+            $set: {
+              date: transaction_date,
+              "dataObject.topPendingTransactionNonLiquid":
+                dataObject.topPendingTransactionNonLiquid,
+              "dataObject.topPendingTransactionLiquid":
+                dataObject.topPendingTransactionLiquid,
+              "dataObject.topPendingTransactionCombined":
+                dataObject.topPendingTransactionCombined,
+              "dataObject.pendingReasonsLiquid":
+                dataObject.pendingReasonsLiquid,
+              "dataObject.pendingReasonsCombine":
+                dataObject.pendingReasonsCombine,
+              "dataObject.pendingReasonsNonLiquid":
+                dataObject.pendingReasonsNonLiquid,
+              "dataObject.rejected_transactions":
+                dataObject.rejected_transactions,
+              "dataObject.deleted_transactions":
+                dataObject.deleted_transactions,
+            },
+          },
+          {
+            upsert: true,
+            new: true,
+          }
+        );
+
+        let response_obj = {
+          topPendingTransactionNonLiquid:
+            cached_data.dataObject.topPendingTransactionNonLiquid,
+          topPendingTransactionLiquid:
+            cached_data.dataObject.topPendingTransactionLiquid,
+          topPendingTransactionCombined:
+            cached_data.dataObject.topPendingTransactionCombined,
+          pendingReasonsLiquid: cached_data.dataObject.pendingReasonsLiquid,
+          pendingReasonsCombine: cached_data.dataObject.pendingReasonsCombine,
+          pendingReasonsNonLiquid:
+            cached_data.dataObject.pendingReasonsNonLiquid,
+          deletedTransactions: cached_data.dataObject.deleted_transactions,
+          rejectedTransactions: cached_data.dataObject.rejected_transactions,
+        };
+        return response_obj;
+      };
+      const obj = await main();
+      return obj;
+    }
+  } catch (e) {
+    console.log("Error in pending transaction controller purchase", e);
+    throw new Error(e);
+  }
+};
